@@ -1,9 +1,9 @@
-name: Build → Push to ECR → Deploy to EC2
+name: Build → Push to ECR → Deploy via SSM (no instance role)
 
 on:
   push:
     tags:
-      - 'v*.*.*'            # only trigger on tag pushes like v1.2.3
+      - 'v*.*.*'
   workflow_dispatch:
     inputs:
       tag:
@@ -15,11 +15,7 @@ env:
   ECR_REGISTRY: "909688465000.dkr.ecr.ap-south-1.amazonaws.com"
   ECR_REPOSITORY: "ust/training"
   AWS_REGION: "ap-south-1"
-  EC2_USER: "ec2-user"
-  EC2_HOST: "ec2-15-207-98-178.ap-south-1.compute.amazonaws.com"
-  EC2_SSH_PORT: "22"
-  CONTAINER_NAME: "ust-training-app"
-  # If your instance private IP is different, update below
+  EC2_PUBLIC_DNS: "ec2-15-207-98-178.ap-south-1.compute.amazonaws.com"
   INSTANCE_PRIVATE_IP: "172.31.2.162"
   HEALTHCHECK_PATH: "/"
   HEALTHCHECK_PORT: "3000"
@@ -27,38 +23,30 @@ env:
   HEALTHCHECK_SLEEP_SECONDS: "5"
 
 jobs:
-  build-push-deploy:
+  build-and-deploy:
     runs-on: ubuntu-latest
     permissions:
       contents: read
 
     steps:
-      - name: Determine and validate tag
-        id: validate
+      - name: Determine tag
+        id: tag
         run: |
           set -euo pipefail
-
-          # If this is a tag push (refs/tags/vX.Y.Z), use that tag; otherwise use workflow_dispatch input
           if [ "${GITHUB_EVENT_NAME:-}" = "push" ] && echo "${GITHUB_REF:-}" | grep -q '^refs/tags/'; then
             TAG="${GITHUB_REF#refs/tags/}"
-            echo "Using tag from push: $TAG"
           else
             TAG="${{ github.event.inputs.tag }}"
-            echo "Using tag from manual input: $TAG"
           fi
-
-          # Validate vMAJOR.MINOR.PATCH
           if ! echo "$TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "::error::Invalid tag: $TAG. Expected pattern vMAJOR.MINOR.PATCH (e.g. v1.0.0)"
+            echo "::error::Invalid tag: $TAG. Expected vMAJOR.MINOR.PATCH"
             exit 1
           fi
-
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+        with: { fetch-depth: 0 }
 
       - name: Configure AWS credentials for runner
         uses: aws-actions/configure-aws-credentials@v2
@@ -70,13 +58,21 @@ jobs:
       - name: Ensure ECR repository exists
         run: |
           aws ecr describe-repositories --repository-names "${ECR_REPOSITORY}" >/dev/null 2>&1 || \
-            aws ecr create-repository --repository-name "${ECR_REPOSITORY}" >/dev/null
-        env:
-          ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
+            aws ecr create-repository --repository-name "${ECR_REPOSITORY}"
+        env: { ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }} }
 
-      - name: Login Docker to ECR (runner)
+      - name: Login Docker to ECR (runner) and get ECR login token
+        id: ecr_login
         run: |
-          aws ecr get-login-password --region "${AWS_REGION}" | docker login --username AWS --password-stdin "${ECR_REGISTRY}"
+          set -euo pipefail
+          echo "Getting ECR login password (this is short-lived)..."
+          LOGIN_PW=$(aws ecr get-login-password --region "${AWS_REGION}")
+          # login on runner so push works
+          echo "$LOGIN_PW" | docker login --username AWS --password-stdin "${ECR_REGISTRY}"
+          # export trimmed token as output (careful: this will be in workflow logs if printed; we won't print)
+          echo "login_pw<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$LOGIN_PW" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
         env:
           AWS_REGION: ${{ env.AWS_REGION }}
           ECR_REGISTRY: ${{ env.ECR_REGISTRY }}
@@ -84,232 +80,162 @@ jobs:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build and push Docker image to ECR
+      - name: Build & push image to ECR
         id: build
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./Dockerfile
           push: true
-          tags: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ steps.validate.outputs.tag }}
+          tags: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ steps.tag.outputs.tag }}
 
-      - name: Deploy to EC2 via SSH (appleboy) — AL2023 aware, creds injected
-        id: deploy_ssh
-        uses: appleboy/ssh-action@v0.1.7
-        with:
-          host: ${{ env.EC2_HOST }}
-          username: ${{ env.EC2_USER }}
-          key: ${{ secrets.AWS_KEY_PAIR }}
-          port: ${{ env.EC2_SSH_PORT }}
-          timeout: 10m
-          script: |
-            set -euxo pipefail
-
-            # Runner-expanded values (so remote script doesn't see unbound vars)
-            ECR_REGISTRY="${{ env.ECR_REGISTRY }}"
-            ECR_REPOSITORY="${{ env.ECR_REPOSITORY }}"
-            AWS_REGION="${{ env.AWS_REGION }}"
-            CONTAINER_NAME="${{ env.CONTAINER_NAME }}"
-            TAG="${{ steps.validate.outputs.tag }}"
-            IMAGE="${ECR_REGISTRY}/${ECR_REPOSITORY}:${TAG}"
-
-            # Inject secrets into remote environment (they will be exported)
-            AWS_ACCESS_KEY_ID="${{ secrets.AWS_ACCESS_KEY_ID }}"
-            AWS_SECRET_ACCESS_KEY="${{ secrets.AWS_SECRET_ACCESS_KEY }}"
-            export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_REGION
-
-            echo "Remote: starting deployment for ${IMAGE}"
-
-            # Detect OS
-            if [ -f /etc/os-release ]; then . /etc/os-release; OS_ID="$ID"; OS_VER="$VERSION_ID"; else OS_ID=unknown; OS_VER=unknown; fi
-            echo "Remote: OS detected: ${OS_ID} ${OS_VER}"
-
-            # Install Docker for Amazon Linux 2023 (dnf) or fallback
-            if ! command -v docker >/dev/null 2>&1; then
-              echo "Remote: Docker not present — installing..."
-              if [ "${OS_ID}" = "amzn" ] && [ "${OS_VER%%.*}" -ge 2023 ]; then
-                sudo dnf -y install docker
-                sudo systemctl enable --now docker
-              elif command -v amazon-linux-extras >/dev/null 2>&1; then
-                sudo amazon-linux-extras install docker -y
-                sudo systemctl enable --now docker
-              elif command -v yum >/dev/null 2>&1; then
-                sudo yum install -y docker
-                sudo systemctl enable --now docker
-              elif [ "${OS_ID}" = "ubuntu" ] || [ "${OS_ID}" = "debian" ]; then
-                sudo apt-get update -y
-                sudo apt-get install -y apt-transport-https ca-certificates curl gnupg-agent software-properties-common
-                curl -fsSL https://download.docker.com/linux/${OS_ID}/gpg | sudo apt-key add -
-                sudo add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/${OS_ID} $(lsb_release -cs) stable"
-                sudo apt-get update -y
-                sudo apt-get install -y docker-ce docker-ce-cli containerd.io
-                sudo systemctl enable --now docker
-              else
-                curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
-                sudo sh /tmp/get-docker.sh
-              fi
-              if id ec2-user >/dev/null 2>&1; then sudo usermod -aG docker ec2-user || true; fi
-            else
-              echo "Remote: docker present: $(docker --version)"
-            fi
-
-            # Ensure aws cli exists (your AMI already has it, but check)
-            if ! command -v aws >/dev/null 2>&1; then
-              echo "Remote: Installing AWS CLI v2..."
-              if command -v dnf >/dev/null 2>&1; then
-                sudo dnf -y install unzip || true
-              elif command -v yum >/dev/null 2>&1; then
-                sudo yum -y install unzip || true
-              else
-                sudo apt-get install -y unzip || true
-              fi
-              curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
-              unzip -q /tmp/awscliv2.zip -d /tmp
-              sudo /tmp/aws/install || true
-            else
-              echo "Remote: aws present: $(aws --version)"
-            fi
-
-            # Verify credentials are present in remote environment
-            if [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
-              echo "Remote: AWS credentials not present; aborting"
-              exit 1
-            fi
-
-            echo "Remote: logging into ECR and pulling ${IMAGE}"
-            aws ecr get-login-password --region "${AWS_REGION}" | docker login --username AWS --password-stdin "${ECR_REGISTRY}"
-            docker pull "${IMAGE}"
-
-            # Stop & remove existing container (if any)
-            if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-              echo "Remote: stopping & removing ${CONTAINER_NAME}"
-              docker rm -f "${CONTAINER_NAME}" || true
-            fi
-
-            # Run container mapping 3000:3000
-            docker run -d --name "${CONTAINER_NAME}" --restart unless-stopped -p 3000:3000 "${IMAGE}"
-
-            echo "Remote: deployment finished"
-            docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"
+      - name: Resolve instance id by public DNS
+        id: find_instance
+        run: |
+          set -euo pipefail
+          PUBLIC_DNS="${{ env.EC2_PUBLIC_DNS }}"
+          INSTANCE_ID=$(aws ec2 describe-instances \
+            --filters "Name=instance-state-name,Values=running" \
+            --query "Reservations[].Instances[?PublicDnsName=='${PUBLIC_DNS}'].InstanceId | [0]" \
+            --output text --region "${AWS_REGION}")
+          if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ]; then
+            echo "::error::Could not find running instance with PublicDnsName=${PUBLIC_DNS}"
+            exit 1
+          fi
+          echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
         env:
-          # give appleboy container context (credentials already injected into remote script above)
+          AWS_REGION: ${{ env.AWS_REGION }}
+
+      - name: Deploy via SSM (pass ECR token to instance)
+        id: ssm_deploy
+        run: |
+          set -euxo pipefail
+
+          INSTANCE_ID="${{ steps.find_instance.outputs.instance_id }}"
+          TAG="${{ steps.tag.outputs.tag }}"
+          IMAGE="${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${TAG}"
+          AWS_REGION="${{ env.AWS_REGION }}"
+
+          # get the login password from the previous step output (multiline handling)
+          LOGIN_PW="$(printf '%s\n' "${{ steps.ecr_login.outputs.login_pw }}")"
+
+          echo "Sending SSM command to instance $INSTANCE_ID to deploy image $IMAGE"
+
+          # Build remote script (the $LOGIN_PW will be expanded here on the runner)
+          read -r -d '' REMOTE <<'EOF'
+#!/bin/bash
+set -euxo pipefail
+
+IMAGE="$1"
+LOGIN_PW="$2"
+AWS_REGION="$3"
+ECR_REGISTRY="$4"
+CONTAINER_NAME="ust-training-app"
+
+echo "Remote: logging into ECR (using provided token)"
+echo "${LOGIN_PW}" | docker login --username AWS --password-stdin "${ECR_REGISTRY}"
+
+echo "Remote: pulling ${IMAGE}"
+docker pull "${IMAGE}"
+
+if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+  echo "Remote: stopping & removing ${CONTAINER_NAME}"
+  docker rm -f "${CONTAINER_NAME}" || true
+fi
+
+echo "Remote: running ${CONTAINER_NAME}"
+docker run -d --name "${CONTAINER_NAME}" --restart unless-stopped -p 3000:3000 "${IMAGE}"
+
+echo "Remote: done"
+EOF
+
+          # send the command, passing IMAGE, LOGIN_PW, AWS_REGION, ECR_REGISTRY as args
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy ${IMAGE}" \
+            --parameters commands=["/bin/bash -c 'bash -s \"${IMAGE}\" \"${LOGIN_PW}\" \"${AWS_REGION}\" \"${{ env.ECR_REGISTRY }}\"'"],workingDirectory=["/tmp"] \
+            --query "Command.CommandId" --output text --region "${AWS_REGION}")
+
+          echo "SSM CommandId: $CMD_ID"
+
+          # wait for completion
+          for i in $(seq 1 60); do
+            STATUS=$(aws ssm list-command-invocations --command-id "$CMD_ID" --details --query "CommandInvocations[0].Status" --output text --region "${AWS_REGION}" ) || STATUS=""
+            echo "Invocation status: $STATUS"
+            if [ "$STATUS" = "Success" ] || [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ] || [ "$STATUS" = "TimedOut" ]; then
+              break
+            fi
+            sleep 5
+          done
+
+          echo "---- SSM STDOUT ----"
+          aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" --query "StandardOutputContent" --output text --region "${AWS_REGION}" || true
+          echo "---- SSM STDERR ----"
+          aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" --query "StandardErrorContent" --output text --region "${AWS_REGION}" || true
+
+          if [ "$STATUS" != "Success" ]; then
+            echo "::error::SSM command ended with status: $STATUS"
+            exit 1
+          fi
+        env:
           AWS_REGION: ${{ env.AWS_REGION }}
           ECR_REGISTRY: ${{ env.ECR_REGISTRY }}
-          ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
-          CONTAINER_NAME: ${{ env.CONTAINER_NAME }}
 
       - name: Health check (public + private)
         id: health
         run: |
           set -euo pipefail
-
-          PUBLIC_HOST="${{ env.EC2_HOST }}"
-          PUBLIC_URL="http://${PUBLIC_HOST}:${{ env.HEALTHCHECK_PORT }}${{ env.HEALTHCHECK_PATH }}"
-
-          PRIVATE_IP="${{ env.INSTANCE_PRIVATE_IP }}"
-          PRIVATE_URL="http://${PRIVATE_IP}:${{ env.HEALTHCHECK_PORT }}${{ env.HEALTHCHECK_PATH }}"
-
+          PUBLIC_URL="http://${{ env.EC2_PUBLIC_DNS }}:${{ env.HEALTHCHECK_PORT }}${{ env.HEALTHCHECK_PATH }}"
+          PRIVATE_URL="http://${{ env.INSTANCE_PRIVATE_IP }}:${{ env.HEALTHCHECK_PORT }}${{ env.HEALTHCHECK_PATH }}"
           RETRIES=${{ env.HEALTHCHECK_RETRIES }}
-          SLEEP_SEC=${{ env.HEALTHCHECK_SLEEP_SECONDS }}
+          SLEEP=${{ env.HEALTHCHECK_SLEEP_SECONDS }}
 
-          # portable sleep
           do_sleep() {
-            if command -v sleep >/dev/null 2>&1; then
-              sleep "$1"
-            else
-              if command -v python3 >/dev/null 2>&1; then
-                python3 - <<PY
-import time,sys
-time.sleep(int(sys.argv[1]))
-PY
-              else
-                python - <<PY
-import time,sys
-time.sleep(int(sys.argv[1]))
-PY
-              fi
-            fi
+            if command -v sleep >/dev/null 2>&1; then sleep "$1"; else python3 -c "import time; time.sleep($1)"; fi
           }
 
-          # portable http check returning status or "error:..."
           http_check() {
             url="$1"
             if command -v curl >/dev/null 2>&1; then
-              code=$(curl -s -o /dev/null -w "%{http_code}" -m 5 "$url" 2>/dev/null) || code="000"
-              echo "$code"
+              curl -s -o /dev/null -w "%{http_code}" -m 5 "$url" || echo "000"
             else
-              if command -v python3 >/dev/null 2>&1; then
-                python3 - <<PY
-import sys,urllib.request,urllib.error
+              python3 - <<PY
+import sys,urllib.request
 url=sys.argv[1]
 try:
   r=urllib.request.urlopen(url, timeout=5)
   print(r.getcode())
-except Exception as e:
-  print("error:"+str(e))
+except Exception:
+  print("000")
 PY
-              else
-                python - <<PY
-import sys,urllib.request,urllib.error
-url=sys.argv[1]
-try:
-  r=urllib.request.urlopen(url, timeout=5)
-  print(r.getcode())
-except Exception as e:
-  print("error:"+str(e))
-PY
-              fi
             fi
           }
 
-          echo "Checking Public URL: ${PUBLIC_URL}"
-          echo "Checking Private URL: ${PRIVATE_URL}"
-          echo ""
+          echo "Public URL: $PUBLIC_URL"
+          echo "Private URL: $PRIVATE_URL"
 
           public_ok=false
-          i=0
-          while [ $i -lt $RETRIES ]; do
-            echo "Public attempt $((i+1))..."
-            status=$(http_check "${PUBLIC_URL}" 2>/dev/null || true)
-            echo "  public result: ${status}"
-            if [ "${status}" = "200" ]; then
-              public_ok=true
-              break
-            fi
-            i=$((i+1))
-            do_sleep "${SLEEP_SEC}"
+          for i in $(seq 1 $RETRIES); do
+            status=$(http_check "$PUBLIC_URL" 2>/dev/null || echo "000")
+            echo "public attempt $i -> $status"
+            if [ "$status" = "200" ]; then public_ok=true; break; fi
+            do_sleep $SLEEP
           done
 
           private_ok=false
-          j=0
-          while [ $j -lt $RETRIES ]; do
-            echo "Private attempt $((j+1))..."
-            status=$(http_check "${PRIVATE_URL}" 2>/dev/null || true)
-            echo "  private result: ${status}"
-            if [ "${status}" = "200" ]; then
-              private_ok=true
-              break
-            fi
-            j=$((j+1))
-            do_sleep "${SLEEP_SEC}"
+          for i in $(seq 1 $RETRIES); do
+            status=$(http_check "$PRIVATE_URL" 2>/dev/null || echo "000")
+            echo "private attempt $i -> $status"
+            if [ "$status" = "200" ]; then private_ok=true; break; fi
+            do_sleep $SLEEP
           done
 
-          echo ""
-          echo "Summary:"
-          echo "  Public (${PUBLIC_URL}) -> ${public_ok}"
-          echo "  Private (${PRIVATE_URL}) -> ${private_ok}"
-
-          if [ "${public_ok}" = "true" ] || [ "${private_ok}" = "true" ]; then
-            echo "Health check passed (at least one endpoint returned HTTP 200)."
+          echo "Summary: public=$public_ok private=$private_ok"
+          if [ "$public_ok" = "true" ] || [ "$private_ok" = "true" ]; then
+            echo "Health check OK"
             exit 0
           else
-            echo "::error::Health check failed on both public and private endpoints."
+            echo "::error::Health check failed"
             exit 1
           fi
-
-      - name: Deployment result
-        if: success()
-        run: |
-          echo "✅ Deployment succeeded!"
-          echo "Public access: http://${{ env.EC2_HOST }}:${{ env.HEALTHCHECK_PORT }}${{ env.HEALTHCHECK_PATH }}"
-          echo "Private access: http://${{ env.INSTANCE_PRIVATE_IP }}:${{ env.HEALTHCHECK_PORT }}${{ env.HEALTHCHECK_PATH }}"
