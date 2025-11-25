@@ -17,3 +17,6 @@ spec:
         image: anusha552/sujitha:v1
         ports:
         - containerPort: 3000
+        env:
+            - name: MONGO_URI
+              value: mongodb://mongo-svc:27017/sujitha
